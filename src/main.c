@@ -386,6 +386,16 @@ static int main_loop(int listenfd)
 						client_process(pollfds.fds[i].fd, pollfds.fds[i].revents);
 					}
 				}
+				/* The QEMU backend has no fd that becomes readable when the
+				 * device has data - IN transfers only happen when we poll for
+				 * them - so it must get a turn even on a client-only wakeup. */
+				if(!done_usb) {
+					if(usb_process() < 0) {
+						usbmuxd_log(LL_FATAL, "usb_process() failed");
+						fdlist_free(&pollfds);
+						return -1;
+					}
+				}
 			}
 		}
 	}

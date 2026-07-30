@@ -26,7 +26,7 @@ usbmuxd_SOURCES = \
 	preflight.c preflight.h \
 	log.c log.h \
 	usbmuxd-proto.h \
-	usb.c usb.h \
+	usb-qemu.c usb.h \
 	utils.c utils.h \
 	conf.c conf.h \
 	main.c
