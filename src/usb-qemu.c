@@ -103,9 +103,20 @@ struct usb_device {
 static int listen_fd = -1;
 static int pending_fd = -1;          /* accepted, enumeration not started */
 static uint64_t pending_ready_ms;    /* when to start driving RESET */
+static int enum_attempts;            /* enumeration tries on this connection */
 static struct usb_device *the_device;
 static int autodiscover = 1;
 static int poll_ms = DEFAULT_POLL_MS;
+
+/*
+ * How long the guest gets to become ready. QEMU dials us as soon as the machine
+ * starts but only answers a USB reset once iOS has programmed the OTG core,
+ * which takes a variable ~100 s of boot. QEMU will not redial unless the core
+ * resets, so giving up on the connection after one failed attempt strands the
+ * device until the emulator is restarted - retry on the same socket instead.
+ */
+#define ENUM_MAX_ATTEMPTS 12
+#define ENUM_RETRY_MS 15000
 
 static uint64_t now_ms(void)
 {
@@ -790,6 +801,7 @@ static void accept_pending(void)
 
 	pending_fd = fd;
 	pending_ready_ms = now_ms() + (uint64_t)delay * 1000;
+	enum_attempts = 0;
 	usbmuxd_log(LL_NOTICE, "QEMU device connected from %s; starting enumeration in %d s",
 	            inet_ntoa(sa.sin_addr), delay);
 }
@@ -818,8 +830,19 @@ int usb_process(void)
 		pending_fd = -1;
 		dev = enumerate(fd);
 		if (!dev) {
-			usbmuxd_log(LL_ERROR, "Enumeration failed; dropping the connection");
-			close(fd);
+			if (++enum_attempts < ENUM_MAX_ATTEMPTS) {
+				usbmuxd_log(LL_WARNING,
+				            "Enumeration attempt %d failed; the guest is probably still "
+				            "booting, retrying in %d s",
+				            enum_attempts, ENUM_RETRY_MS / 1000);
+				pending_fd = fd;
+				pending_ready_ms = now_ms() + ENUM_RETRY_MS;
+			} else {
+				usbmuxd_log(LL_ERROR,
+				            "Enumeration failed %d times; dropping the connection",
+				            enum_attempts);
+				close(fd);
+			}
 		} else {
 			the_device = dev;
 			if (device_add(dev) < 0) {

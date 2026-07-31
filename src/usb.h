@@ -34,12 +34,17 @@
 #define USB_MRU 16384
 
 // max transmission packet size
-// libusb fragments these too, but doesn't send ZLPs so we're safe
-// but we need to send a ZLP ourselves at the end (see usb-linux.c)
-// we're using 3 * 16384 to optimize for the fragmentation
-// this results in three URBs per full transfer, 32 USB packets each
-// if there are ZLP issues this should make them show up easily too
-#define USB_MTU (3 * 16384)
+//
+// Upstream uses 3 * 16384 to suit libusb's fragmentation. The QEMU transport
+// cannot express a transaction larger than 16384 (the wire header's length is
+// an int16_t), so anything above this has to be sent as several transactions -
+// and the device model treats each one as a completed transfer, raising
+// XferCompl and disabling the endpoint even when the guest's armed transfer is
+// only partly filled. The guest's mux driver then reassembles from truncated
+// transfers and the stream desynchronises. Capping the MTU keeps every mux
+// packet inside a single transaction; device.c derives conn->max_payload from
+// this, so it bounds the whole TX path.
+#define USB_MTU 16384
 
 #define USB_PACKET_SIZE 512
 
