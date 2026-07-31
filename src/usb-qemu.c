@@ -222,6 +222,16 @@ static int qemu_xfer(int fd, uint8_t ep, uint8_t flags, int length,
 		return n;
 	}
 
+	/* An OUT can never be acknowledged for more than was submitted; the device
+	 * model clamps amtDone to the request length. If it ever happens, believing
+	 * it would advance our offset past data the guest never received. */
+	if (!(ep & USB_DIR_IN) && hdr.length > length) {
+		usbmuxd_log(LL_ERROR,
+		            "PROTOCOL: ep 0x%02x acknowledged %d bytes for a %d byte OUT; clamping",
+		            ep, (int)hdr.length, length);
+		return length;
+	}
+
 	return hdr.length;
 }
 
@@ -668,13 +678,17 @@ int usb_get_timeout(void)
 
 int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 {
-	int sent = 0;
+	static unsigned call_seq;
+	unsigned seq = ++call_seq;
+	int sent = 0, txn = 0, naks = 0;
 	uint64_t deadline = now_ms() + SEND_TIMEOUT_MS;
 
 	if (!dev->alive) {
 		free((void *)buf);
 		return -1;
 	}
+
+	usbmuxd_log(LL_NOTICE, "OUT#%u begin: %d bytes to ep 0x%02x", seq, length, dev->ep_out);
 
 	while (sent < length) {
 		int chunk = length - sent;
@@ -683,20 +697,35 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 			chunk = QEMU_MAX_XFER;
 
 		r = qemu_xfer(dev->fd, dev->ep_out, 0, chunk, buf + sent, NULL, NULL);
+		txn++;
 		if (r > 0) {
+			usbmuxd_log(LL_NOTICE,
+			            "OUT#%u txn %d: offset %d submitted %d accepted %d -> offset %d (after %d NAKs)",
+			            seq, txn, sent, chunk, r, sent + r, naks);
 			sent += r;
+			naks = 0;
 			deadline = now_ms() + SEND_TIMEOUT_MS;
 			continue;
 		}
+		if (r == 0) {
+			usbmuxd_log(LL_WARNING,
+			            "OUT#%u txn %d: offset %d submitted %d accepted 0 (endpoint armed with a zero-length transfer)",
+			            seq, txn, sent, chunk);
+			naks++;
+			sleep_ms(1);
+			continue;
+		}
 		if (r == RET_IO || r == RET_NODEV || r == RET_STALL) {
-			usbmuxd_log(LL_ERROR, "Bulk OUT failed after %d of %d bytes: %s",
-			            sent, length, ret_name(r));
+			usbmuxd_log(LL_ERROR, "OUT#%u txn %d: failed at offset %d of %d: %s",
+			            seq, txn, sent, length, ret_name(r));
 			dev->alive = 0;
 			free((void *)buf);
 			return -1;
 		}
+		naks++;
 		if (now_ms() > deadline) {
-			usbmuxd_log(LL_ERROR, "Bulk OUT stalled after %d of %d bytes", sent, length);
+			usbmuxd_log(LL_ERROR, "OUT#%u txn %d: stalled at offset %d of %d after %d NAKs",
+			            seq, txn, sent, length, naks);
 			dev->alive = 0;
 			free((void *)buf);
 			return -1;
@@ -704,7 +733,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 		sleep_ms(1);
 	}
 
-	usbmuxd_log(LL_SPEW, "Bulk OUT %d bytes", length);
+	usbmuxd_log(LL_NOTICE, "OUT#%u done: %d bytes in %d transaction(s)", seq, sent, txn);
 	free((void *)buf);
 	return 0;
 }
@@ -803,7 +832,9 @@ int usb_process(void)
 		for (i = 0; i < RX_BURST; i++) {
 			int r = qemu_xfer(dev->fd, dev->ep_in, 0, USB_MRU, NULL, dev->rxbuf, NULL);
 			if (r > 0) {
-				usbmuxd_log(LL_SPEW, "Bulk IN %d bytes", r);
+				static unsigned in_seq;
+				usbmuxd_log(LL_NOTICE, "IN#%u: %d bytes from ep 0x%02x (requested %d)",
+				            ++in_seq, r, dev->ep_in, USB_MRU);
 				device_data_input(dev, dev->rxbuf, r);
 				if (!the_device || !the_device->alive)
 					break;
