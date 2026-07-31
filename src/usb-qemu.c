@@ -694,10 +694,13 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 	int sent = 0, txn = 0, naks = 0, accepted = 0;
 	uint64_t deadline = now_ms() + SEND_TIMEOUT_MS;
 
-	if (!dev->alive) {
-		free((void *)buf);
+	/*
+	 * Buffer ownership follows the libusb backend: it transfers to us only on
+	 * success, and device.c's send_packet frees it itself on failure. Freeing
+	 * it on an error path here is a double free.
+	 */
+	if (!dev->alive)
 		return -1;
-	}
 
 	usbmuxd_log(LL_NOTICE, "OUT#%u begin: %d bytes to ep 0x%02x", seq, length, dev->ep_out);
 
@@ -731,7 +734,6 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 			usbmuxd_log(LL_ERROR, "OUT#%u txn %d: failed at offset %d of %d: %s",
 			            seq, txn, sent, length, ret_name(r));
 			dev->alive = 0;
-			free((void *)buf);
 			return -1;
 		}
 		naks++;
@@ -739,7 +741,6 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 			usbmuxd_log(LL_ERROR, "OUT#%u txn %d: stalled at offset %d of %d after %d NAKs",
 			            seq, txn, sent, length, naks);
 			dev->alive = 0;
-			free((void *)buf);
 			return -1;
 		}
 		sleep_ms(1);
