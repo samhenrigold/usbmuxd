@@ -680,7 +680,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 {
 	static unsigned call_seq;
 	unsigned seq = ++call_seq;
-	int sent = 0, txn = 0, naks = 0;
+	int sent = 0, txn = 0, naks = 0, accepted = 0;
 	uint64_t deadline = now_ms() + SEND_TIMEOUT_MS;
 
 	if (!dev->alive) {
@@ -703,6 +703,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 			            "OUT#%u txn %d: offset %d submitted %d accepted %d -> offset %d (after %d NAKs)",
 			            seq, txn, sent, chunk, r, sent + r, naks);
 			sent += r;
+			accepted++;
 			naks = 0;
 			deadline = now_ms() + SEND_TIMEOUT_MS;
 			continue;
@@ -733,7 +734,10 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 		sleep_ms(1);
 	}
 
-	usbmuxd_log(LL_NOTICE, "OUT#%u done: %d bytes in %d transaction(s)", seq, sent, txn);
+	/* "accepted" is what answers "was this split?" - txn also counts NAK
+	 * retries, which are just flow control and say nothing about framing. */
+	usbmuxd_log(LL_NOTICE, "OUT#%u done: %d bytes, %s (%d accepted transfer(s), %d round trip(s))",
+	            seq, sent, accepted > 1 ? "SPLIT" : "whole", accepted, txn);
 	free((void *)buf);
 	return 0;
 }
