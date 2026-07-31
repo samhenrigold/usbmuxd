@@ -57,6 +57,22 @@ struct tcp_usb_header {
 #define TU_SETUP    (1 << 0)
 #define TU_RESET    (1 << 1)
 #define TU_ENUMDONE (1 << 2)
+#define TU_HELLO    (1 << 3)
+
+/*
+ * Version handshake. Specified in qemu-ios docs/tcp-usb-protocol.md; keep this
+ * in step with include/hw/arm/ipod_touch_tcp_usb.h.
+ */
+#define TU_EP_CONTROL           0x7f
+#define TU_HELLO_MAGIC          0x42535554u  /* "TUSB" */
+#define TU_PROTOCOL_VERSION     1
+
+struct tcp_usb_hello {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t reserved;
+	uint32_t max_transaction;
+} __attribute__((packed));
 
 #define USB_DIR_IN  0x80
 
@@ -425,6 +441,59 @@ done:
 }
 
 /*
+ * Agree a protocol version with the device before doing anything else.
+ *
+ * The two halves of this transport live in separate repositories, and they used
+ * to agree on its constraints only by convention. They disagreed: usbmuxd's
+ * default MTU was larger than any single transaction the wire format can carry,
+ * so large writes were split, the device retired each fragment as a completed
+ * transfer, and the guest reassembled garbage -- silently. Asking the device
+ * what it will accept turns that class of mistake into a startup error.
+ */
+static int handshake(int fd)
+{
+	struct tcp_usb_hello hello;
+	int r = qemu_xfer(fd, USB_DIR_IN | TU_EP_CONTROL, TU_HELLO,
+	                  sizeof(hello), NULL, (unsigned char *)&hello, NULL);
+
+	if (r == RET_IO) {
+		usbmuxd_log(LL_ERROR, "Handshake failed: link went away");
+		return -1;
+	}
+	if (r < 0) {
+		usbmuxd_log(LL_ERROR,
+		            "Handshake refused (%s). This device predates the version "
+		            "handshake -- the emulator is older than this backend.",
+		            ret_name(r));
+		return -1;
+	}
+	if (r < (int)sizeof(hello) || hello.magic != TU_HELLO_MAGIC) {
+		usbmuxd_log(LL_ERROR, "Handshake malformed: %d bytes, magic 0x%08x", r,
+		            r >= 4 ? hello.magic : 0);
+		return -1;
+	}
+	if (hello.version != TU_PROTOCOL_VERSION) {
+		usbmuxd_log(LL_ERROR,
+		            "Protocol version mismatch: device speaks v%u, this backend "
+		            "speaks v%u. Update whichever half is older.",
+		            hello.version, TU_PROTOCOL_VERSION);
+		return -1;
+	}
+	if (USB_MTU > hello.max_transaction) {
+		usbmuxd_log(LL_ERROR,
+		            "USB_MTU is %d but the device accepts at most %u bytes in one "
+		            "transaction. Splitting a packet corrupts the stream silently, "
+		            "so refusing to attach. Lower USB_MTU in src/usb.h.",
+		            USB_MTU, hello.max_transaction);
+		return -1;
+	}
+
+	usbmuxd_log(LL_NOTICE, "Handshake ok: protocol v%u, max transaction %u bytes, MTU %d",
+	            hello.version, hello.max_transaction, USB_MTU);
+	return 0;
+}
+
+/*
  * Drive the link from cable-plug to a configured device with a known serial.
  * Runs inline; the daemon's main loop is blocked while it happens, which is
  * acceptable because nothing else can make progress until there is a device.
@@ -439,6 +508,9 @@ static struct usb_device *enumerate(int fd)
 	uint16_t langid = 0x0409;
 	uint8_t iserial;
 	int r, n, cfg_index, chosen = -1;
+
+	if (handshake(fd) < 0)
+		return NULL;
 
 	usbmuxd_log(LL_NOTICE, "Driving USB reset");
 	if (qemu_xfer(fd, 0x00, TU_RESET, 0, NULL, NULL, NULL) == RET_IO)
