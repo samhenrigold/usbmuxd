@@ -388,13 +388,20 @@ static int main_loop(int listenfd)
 				}
 				/* The QEMU backend has no fd that becomes readable when the
 				 * device has data - IN transfers only happen when we poll for
-				 * them - so it must get a turn even on a client-only wakeup. */
+				 * them - so it must get a turn even on a client-only wakeup.
+				 * done_usb matters here: this block sits inside the per-fd loop
+				 * but outside the revents guard, so without it usb_process ran
+				 * once PER POLLED FD instead of once per wakeup. With a listen
+				 * fd, the QEMU fd and a couple of clients that is 4x the
+				 * bulk-IN round trips, each one synchronous work for a QEMU
+				 * main loop that is already the bottleneck during an install. */
 				if(!done_usb) {
 					if(usb_process() < 0) {
 						usbmuxd_log(LL_FATAL, "usb_process() failed");
 						fdlist_free(&pollfds);
 						return -1;
 					}
+					done_usb = 1;
 				}
 			}
 		}

@@ -163,18 +163,48 @@ static const char *ret_name(int r)
 
 /* --- raw socket helpers -------------------------------------------------- */
 
+/*
+ * How long one transfer may stall before we give up on the link.
+ *
+ * SO_RCVTIMEO/SO_SNDTIMEO surface as EAGAIN, and these loops used to retry it
+ * exactly like EINTR -- no deadline, no sleep. That made the socket timeouts
+ * dead code: once they expired the loop merely stopped blocking in the kernel
+ * and started spinning a core. usbmuxd is single-threaded, so while it spun it
+ * accepted no clients, serviced no fds, ran no device timeouts, and never got
+ * back to ppoll to re-test should_exit -- so it ignored SIGTERM and survived as
+ * a spinning orphan across app relaunches. EINTR is not a stall and is still
+ * retried forever; EAGAIN is now bounded by wall clock.
+ */
+#define XFER_STALL_MS 30000
+
+static int stalled(uint64_t started_ms, const char *dir)
+{
+	if (mstime64() - started_ms < XFER_STALL_MS)
+		return 0;
+	usbmuxd_log(LL_ERROR, "Device stalled >%d ms during %s; dropping the link",
+	            XFER_STALL_MS, dir);
+	return 1;
+}
+
 static int write_all(int fd, const void *buf, size_t len)
 {
 	const char *p = buf;
+	uint64_t started = mstime64();
 	while (len) {
 		ssize_t r = write(fd, p, len);
 		if (r > 0) {
 			p += r;
 			len -= r;
+			started = mstime64();   /* progress -- restart the stall clock */
 			continue;
 		}
-		if (r < 0 && (errno == EINTR || errno == EAGAIN))
+		if (r < 0 && errno == EINTR)
 			continue;
+		if (r < 0 && errno == EAGAIN) {
+			if (stalled(started, "write"))
+				return -1;
+			continue;
+		}
 		return -1;
 	}
 	return 0;
@@ -183,15 +213,22 @@ static int write_all(int fd, const void *buf, size_t len)
 static int read_all(int fd, void *buf, size_t len)
 {
 	char *p = buf;
+	uint64_t started = mstime64();
 	while (len) {
 		ssize_t r = read(fd, p, len);
 		if (r > 0) {
 			p += r;
 			len -= r;
+			started = mstime64();
 			continue;
 		}
-		if (r < 0 && (errno == EINTR || errno == EAGAIN))
+		if (r < 0 && errno == EINTR)
 			continue;
+		if (r < 0 && errno == EAGAIN) {
+			if (stalled(started, "read"))
+				return -1;
+			continue;
+		}
 		return -1;
 	}
 	return 0;
@@ -451,11 +488,11 @@ done:
  * transfer, and the guest reassembled garbage -- silently. Asking the device
  * what it will accept turns that class of mistake into a startup error.
  */
-static int handshake(int fd)
+static int handshake(int fd, uint8_t *ret_addr)
 {
 	struct tcp_usb_hello hello;
 	int r = qemu_xfer(fd, USB_DIR_IN | TU_EP_CONTROL, TU_HELLO,
-	                  sizeof(hello), NULL, (unsigned char *)&hello, NULL);
+	                  sizeof(hello), NULL, (unsigned char *)&hello, ret_addr);
 
 	if (r == RET_IO) {
 		usbmuxd_log(LL_ERROR, "Handshake failed: link went away");
@@ -508,20 +545,47 @@ static struct usb_device *enumerate(int fd)
 	uint8_t addr = 0;
 	uint16_t langid = 0x0409;
 	uint8_t iserial;
+	bool resumed;
 	int r, n, cfg_index, chosen = -1;
 
-	if (handshake(fd) < 0)
+	/*
+	 * Is this guest resuming from a snapshot rather than cold-booting?
+	 *
+	 * The device stamps its programmed DCFG address into every reply header,
+	 * and dcfg (with in_eps/out_eps) is migrated in vmstate_synopsys_usb. So a
+	 * resumed guest answers the very first HELLO with addr != 0, while a cold
+	 * boot answers 0. No protocol change is needed -- the answer is already on
+	 * the wire, handshake() was simply discarding it.
+	 *
+	 * This matters because the cold-boot sequence WEDGES a resumed guest: the
+	 * app restores a snapshot in which USB is fully enumerated and a mux
+	 * session is live, then this daemon -- a brand new process that knows
+	 * nothing about it -- drove TU_RESET at a driver that is mid-session and
+	 * expects no such event, and re-issued SET_CONFIGURATION, which makes iOS
+	 * tear down and rebuild the mux interface. Skip exactly the steps that
+	 * mutate device state; keep every read-only one, since EP0 stays armed for
+	 * SETUP on a configured device and answers descriptor reads normally.
+	 */
+	if (handshake(fd, &addr) < 0)
 		return NULL;
+	resumed = (addr != 0);
 
-	usbmuxd_log(LL_NOTICE, "Driving USB reset");
-	if (qemu_xfer(fd, 0x00, TU_RESET, 0, NULL, NULL, NULL) == RET_IO)
-		return NULL;
-	sleep_ms(500);
+	if (resumed) {
+		usbmuxd_log(LL_NOTICE,
+		            "Device is already enumerated at address %d (resumed from a "
+		            "snapshot); adopting the live session instead of resetting it",
+		            addr);
+	} else {
+		usbmuxd_log(LL_NOTICE, "Driving USB reset");
+		if (qemu_xfer(fd, 0x00, TU_RESET, 0, NULL, NULL, NULL) == RET_IO)
+			return NULL;
+		sleep_ms(500);
 
-	usbmuxd_log(LL_NOTICE, "Signalling enumeration done");
-	if (qemu_xfer(fd, 0x00, TU_ENUMDONE, 0, NULL, NULL, NULL) == RET_IO)
-		return NULL;
-	sleep_ms(500);
+		usbmuxd_log(LL_NOTICE, "Signalling enumeration done");
+		if (qemu_xfer(fd, 0x00, TU_ENUMDONE, 0, NULL, NULL, NULL) == RET_IO)
+			return NULL;
+		sleep_ms(500);
+	}
 
 	n = ctrl_in(fd, 0x80, 0x06, (0x01 << 8) | 0, 0, devdesc, sizeof(devdesc));
 	if (n < 18) {
@@ -545,20 +609,24 @@ static struct usb_device *enumerate(int fd)
 	            devdesc[8] | (devdesc[9] << 8), dev->pid,
 	            devdesc[3], devdesc[2], devdesc[17]);
 
-	if (ctrl_out(fd, 0x00, 0x05, 1, 0, NULL) < 0) {
-		usbmuxd_log(LL_ERROR, "SET_ADDRESS failed");
-		goto fail;
-	}
-	/* The device reports its DCFG address back in every reply header, which is
-	 * how we learn the guest actually programmed it. */
-	{
-		uint64_t deadline = now_ms() + 2000;
-		do {
-			qemu_xfer(fd, USB_DIR_IN, 0, 0, NULL, NULL, &addr);
-			if (addr == 1)
-				break;
-			sleep_ms(10);
-		} while (now_ms() < deadline);
+	/* A resumed device already has an address the guest programmed before the
+	 * snapshot; re-addressing it would disturb a live session for nothing. */
+	if (!resumed) {
+		if (ctrl_out(fd, 0x00, 0x05, 1, 0, NULL) < 0) {
+			usbmuxd_log(LL_ERROR, "SET_ADDRESS failed");
+			goto fail;
+		}
+		/* The device reports its DCFG address back in every reply header, which
+		 * is how we learn the guest actually programmed it. */
+		{
+			uint64_t deadline = now_ms() + 2000;
+			do {
+				qemu_xfer(fd, USB_DIR_IN, 0, 0, NULL, NULL, &addr);
+				if (addr == 1)
+					break;
+				sleep_ms(10);
+			} while (now_ms() < deadline);
+		}
 	}
 	dev->address = addr;
 	usbmuxd_log(LL_NOTICE, "Device address is %d", addr);
@@ -598,14 +666,20 @@ static struct usb_device *enumerate(int fd)
 		goto fail;
 	}
 
-	if (ctrl_out(fd, 0x00, 0x09, chosen, 0, NULL) < 0) {
-		usbmuxd_log(LL_ERROR, "SET_CONFIGURATION %d failed", chosen);
-		goto fail;
-	}
-	if (dev->altsetting != 0 &&
-	    ctrl_out(fd, 0x01, 0x0b, dev->altsetting, dev->interface, NULL) < 0) {
-		usbmuxd_log(LL_WARNING, "SET_INTERFACE %d/%d failed, continuing",
-		            dev->interface, dev->altsetting);
+	/* find_mux_interface derived interface/altsetting/ep_in/ep_out from the
+	 * descriptor bytes alone, so a resumed device is fully described without
+	 * re-issuing these. Re-configuring an already-configured device is what
+	 * makes iOS tear the mux interface down and rebuild it. */
+	if (!resumed) {
+		if (ctrl_out(fd, 0x00, 0x09, chosen, 0, NULL) < 0) {
+			usbmuxd_log(LL_ERROR, "SET_CONFIGURATION %d failed", chosen);
+			goto fail;
+		}
+		if (dev->altsetting != 0 &&
+		    ctrl_out(fd, 0x01, 0x0b, dev->altsetting, dev->interface, NULL) < 0) {
+			usbmuxd_log(LL_WARNING, "SET_INTERFACE %d/%d failed, continuing",
+			            dev->interface, dev->altsetting);
+		}
 	}
 
 	/* Index 0 is the list of supported language IDs. */
