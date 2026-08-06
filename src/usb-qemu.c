@@ -41,6 +41,12 @@
 #include <arpa/inet.h>
 
 #include "usb.h"
+
+/* main.c's shutdown flag. The exit signals are process-blocked outside ppoll(),
+ * so a SIGTERM arriving while we are inside enumerate() is not delivered until
+ * we return -- which used to mean the app's teardown waited out every control
+ * timeout while the listening socket stayed bound. */
+extern int should_exit;
 #include "log.h"
 #include "device.h"
 #include "utils.h"
@@ -93,6 +99,15 @@ struct tcp_usb_hello {
 
 /* How long to keep retrying a NAKing transaction before giving up. */
 #define CTRL_TIMEOUT_MS   15000
+/*
+ * How long the first descriptor read waits before concluding "the guest has not
+ * armed EP0 yet". QEMU dials us at realize time, minutes before iOS loads
+ * AppleSynopsysOTG2, so most enumeration attempts during a cold boot are asking
+ * a device that cannot answer. Spending the full 15 s on each of those blocks
+ * the whole daemon -- no client accepts, no signal delivery -- for the entire
+ * boot everyone is waiting on.
+ */
+#define CTRL_PROBE_MS      1000
 #define STATUS_TIMEOUT_MS 500
 #define SEND_TIMEOUT_MS   10000
 
@@ -118,8 +133,20 @@ struct usb_device {
 
 static int listen_fd = -1;
 static int pending_fd = -1;          /* accepted, enumeration not started */
+static int ctrl_timeout_ms = CTRL_TIMEOUT_MS;  /* tightened for the first probe */
+/*
+ * Did WE drive SET_ADDRESS on this link? The guest stamps its live DCFG address
+ * into every reply header, so "addr != 0" means "addressed" -- not necessarily
+ * "resumed from a snapshot". After our own SET_ADDRESS lands, any later attempt
+ * on the same guest saw addr == 1 and took the resume path, skipping
+ * SET_CONFIGURATION -- so the mux interface was never activated, the device sat
+ * in MUXDEV_INIT forever, no client ever saw it, and nothing re-enumerated.
+ * That is the "it enumerates but never attaches, restart the VM" failure.
+ */
+static int addressed_by_us;
 static uint64_t pending_ready_ms;    /* when to start driving RESET */
-static int enum_attempts;            /* enumeration tries on this connection */
+static int enum_attempts;            /* cumulative enumeration tries */
+static int first_dial = 1;           /* the configured delay is for dial #1 only */
 static struct usb_device *the_device;
 static int autodiscover = 1;
 static int poll_ms = DEFAULT_POLL_MS;
@@ -269,8 +296,14 @@ static int qemu_xfer(int fd, uint8_t ep, uint8_t flags, int length,
 
 	if ((hdr.ep & USB_DIR_IN) && hdr.length > 0) {
 		int n = hdr.length;
-		if (n > length)   /* the device must never overrun what we asked for */
-			n = length;
+		if (n > length) {
+			/* Clamping would leave the residue in the socket and every later
+			 * transaction would read the previous one's tail -- silently and
+			 * permanently. A desynced stream is not recoverable; drop it. */
+			usbmuxd_log(LL_ERROR, "PROTOCOL: ep 0x%02x returned %d bytes for a "
+			            "%d byte IN", ep, (int)hdr.length, length);
+			return RET_IO;
+		}
 		if (in_data) {
 			if (read_all(fd, in_data, n) < 0)
 				return RET_IO;
@@ -305,14 +338,14 @@ static int qemu_xfer(int fd, uint8_t ep, uint8_t flags, int length,
 /* Deliver the 8-byte setup packet as a SETUP-flagged OUT on EP0. */
 static int send_setup(int fd, const unsigned char *setup, uint8_t *addr)
 {
-	uint64_t deadline = now_ms() + CTRL_TIMEOUT_MS;
+	uint64_t deadline = now_ms() + ctrl_timeout_ms;
 	for (;;) {
 		int r = qemu_xfer(fd, 0x00, TU_SETUP, 8, setup, NULL, addr);
 		if (r >= 0)
 			return 0;
 		if (r == RET_IO || r == RET_NODEV)
 			return -1;
-		if (now_ms() > deadline) {
+		if (now_ms() > deadline || should_exit) {
 			usbmuxd_log(LL_ERROR, "SETUP never accepted (%s)", ret_name(r));
 			return -1;
 		}
@@ -333,7 +366,7 @@ static void status_stage(int fd, int in)
 		int r = qemu_xfer(fd, in ? USB_DIR_IN : 0x00, 0, 0, NULL, NULL, NULL);
 		if (r >= 0 || r == RET_IO || r == RET_NODEV)
 			return;
-		if (now_ms() > deadline)
+		if (now_ms() > deadline || should_exit)
 			return;
 		sleep_ms(1);
 	}
@@ -365,7 +398,7 @@ static int ctrl_in(int fd, uint8_t bmRequestType, uint8_t bRequest,
 	if (send_setup(fd, setup, NULL) < 0)
 		return -1;
 
-	deadline = now_ms() + CTRL_TIMEOUT_MS;
+	deadline = now_ms() + ctrl_timeout_ms;
 	while (total < wLength) {
 		int r = qemu_xfer(fd, USB_DIR_IN, 0, wLength - total, NULL, buf + total, NULL);
 		if (r > 0) {
@@ -384,7 +417,7 @@ static int ctrl_in(int fd, uint8_t bmRequestType, uint8_t bRequest,
 		/* NAK */
 		if (total > 0 && ++naks > IN_IDLE_NAKS)
 			break;
-		if (now_ms() > deadline) {
+		if (now_ms() > deadline || should_exit) {
 			if (total > 0)
 				break;
 			usbmuxd_log(LL_ERROR, "control IN req 0x%02x timed out", bRequest);
@@ -418,7 +451,7 @@ static void decode_string(const unsigned char *data, int len, char *out, size_t 
 	int si;
 	if (len < 2)
 		len = 0;
-	for (si = 2; si < len && si < data[0] && di < outsz - 1; si += 2) {
+	for (si = 2; si + 1 < len && si < data[0] && di < outsz - 1; si += 2) {
 		if ((data[si] & 0x80) || data[si + 1])
 			out[di++] = '?';
 		else if (data[si] == '\0')
@@ -566,9 +599,12 @@ static struct usb_device *enumerate(int fd)
 	 * mutate device state; keep every read-only one, since EP0 stays armed for
 	 * SETUP on a configured device and answers descriptor reads normally.
 	 */
+	ctrl_timeout_ms = CTRL_PROBE_MS;   /* until the guest proves it can answer */
 	if (handshake(fd, &addr) < 0)
 		return NULL;
-	resumed = (addr != 0);
+	if (addr == 0)
+		addressed_by_us = 0;           /* the guest reset its core; start over */
+	resumed = (addr != 0 && !addressed_by_us);
 
 	if (resumed) {
 		usbmuxd_log(LL_NOTICE,
@@ -588,6 +624,7 @@ static struct usb_device *enumerate(int fd)
 	}
 
 	n = ctrl_in(fd, 0x80, 0x06, (0x01 << 8) | 0, 0, devdesc, sizeof(devdesc));
+	ctrl_timeout_ms = CTRL_TIMEOUT_MS;   /* it is awake; be patient from here */
 	if (n < 18) {
 		usbmuxd_log(LL_ERROR, "Could not read the device descriptor (%d bytes)", n);
 		return NULL;
@@ -627,6 +664,7 @@ static struct usb_device *enumerate(int fd)
 				sleep_ms(10);
 			} while (now_ms() < deadline);
 		}
+		addressed_by_us = 1;
 	}
 	dev->address = addr;
 	usbmuxd_log(LL_NOTICE, "Device address is %d", addr);
@@ -950,9 +988,15 @@ static void accept_pending(void)
 	if (delay < 0)
 		delay = 0;
 
+	/* The configured delay exists to skip the iBoot phase's noise on the very
+	 * first dial. A redial means an attempt already failed and the guest is
+	 * further along, so waiting the full delay again just slows attach down. */
+	if (!first_dial)
+		delay = 2;
+	first_dial = 0;
+
 	pending_fd = fd;
 	pending_ready_ms = now_ms() + (uint64_t)delay * 1000;
-	enum_attempts = 0;
 	usbmuxd_log(LL_NOTICE, "QEMU device connected from %s; starting enumeration in %d s",
 	            inet_ntoa(sa.sin_addr), delay);
 }
@@ -981,23 +1025,21 @@ int usb_process(void)
 		pending_fd = -1;
 		dev = enumerate(fd);
 		if (!dev) {
-			/* EOF means QEMU hung up (it redials on the guest's next core
-			 * reset); -1/EAGAIN is just a quiet line - the device never
-			 * speaks unprompted - so the guest is still booting. */
-			char probe;
-			if (recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
-				usbmuxd_log(LL_WARNING,
-				            "QEMU hung up after %d enumeration attempt(s); "
-				            "waiting for it to redial", enum_attempts + 1);
-				close(fd);
-			} else {
-				usbmuxd_log(LL_WARNING,
-				            "Enumeration attempt %d failed; the guest is probably still "
-				            "booting, retrying in %d s",
-				            ++enum_attempts, ENUM_RETRY_MS / 1000);
-				pending_fd = fd;
-				pending_ready_ms = now_ms() + ENUM_RETRY_MS;
-			}
+			/*
+			 * Always drop the link. Retrying on the SAME socket looked cheaper
+			 * but kept a link that may already be unusable: an aborted transfer
+			 * leaves the stream one transaction out of step forever, and a
+			 * guest-side core reset closes the socket with our request still
+			 * queued, which surfaces as ECONNRESET rather than the EOF this
+			 * used to test for. Either way pending_fd stayed set -- and while
+			 * it is set, accept_pending() REJECTS the redial QEMU is making
+			 * every 3 s, so the device could never attach again without
+			 * restarting the VM.
+			 */
+			usbmuxd_log(LL_WARNING,
+			            "Enumeration attempt %d failed; dropping the link, "
+			            "QEMU redials within 3 s", ++enum_attempts);
+			close(fd);
 		} else {
 			the_device = dev;
 			if (device_add(dev) < 0) {
