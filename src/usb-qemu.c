@@ -127,12 +127,13 @@ static int poll_ms = DEFAULT_POLL_MS;
 /*
  * How long the guest gets to become ready. QEMU dials us as soon as the machine
  * starts but only answers a USB reset once iOS has programmed the OTG core,
- * which takes a variable ~100 s of boot. QEMU will not redial unless the core
- * resets, so giving up on the connection after one failed attempt strands the
- * device until the emulator is restarted - retry on the same socket instead.
+ * which takes a variable amount of boot - well past three minutes on a first
+ * boot that is still unpacking the NAND. QEMU will not redial unless the core
+ * resets, so giving up on the connection strands the device until the emulator
+ * is restarted: there is no attempt cap, only "is QEMU still on the line". A
+ * dead line is retired so the redial is not rejected as a second connection.
  */
-#define ENUM_MAX_ATTEMPTS 12
-#define ENUM_RETRY_MS 15000
+#define ENUM_RETRY_MS 5000
 
 static uint64_t now_ms(void)
 {
@@ -861,8 +862,11 @@ static void accept_pending(void)
 
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	/* Blocking with a timeout: every transaction is a round trip and a wedged
-	 * QEMU must not freeze the daemon forever. */
-	tv.tv_sec = 10;
+	 * QEMU must not freeze the daemon forever. Generous on purpose - 10 s was
+	 * short enough that a guest pegging its CPU (installd unpacking an app on
+	 * 128 MB) stalled QEMU's IO past it, and the "device" died mid-install
+	 * while both ends were actually fine. */
+	tv.tv_sec = 30;
 	tv.tv_usec = 0;
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -903,18 +907,22 @@ int usb_process(void)
 		pending_fd = -1;
 		dev = enumerate(fd);
 		if (!dev) {
-			if (++enum_attempts < ENUM_MAX_ATTEMPTS) {
+			/* EOF means QEMU hung up (it redials on the guest's next core
+			 * reset); -1/EAGAIN is just a quiet line - the device never
+			 * speaks unprompted - so the guest is still booting. */
+			char probe;
+			if (recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
+				usbmuxd_log(LL_WARNING,
+				            "QEMU hung up after %d enumeration attempt(s); "
+				            "waiting for it to redial", enum_attempts + 1);
+				close(fd);
+			} else {
 				usbmuxd_log(LL_WARNING,
 				            "Enumeration attempt %d failed; the guest is probably still "
 				            "booting, retrying in %d s",
-				            enum_attempts, ENUM_RETRY_MS / 1000);
+				            ++enum_attempts, ENUM_RETRY_MS / 1000);
 				pending_fd = fd;
 				pending_ready_ms = now_ms() + ENUM_RETRY_MS;
-			} else {
-				usbmuxd_log(LL_ERROR,
-				            "Enumeration failed %d times; dropping the connection",
-				            enum_attempts);
-				close(fd);
 			}
 		} else {
 			the_device = dev;
