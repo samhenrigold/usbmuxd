@@ -77,6 +77,29 @@ static const char *listen_addr = NULL;
 
 static int report_to_parent = 0;
 
+#ifdef HAVE_LIBIMOBILEDEVICE
+/* libusbmuxd requires UNIX: for local paths, while TCP endpoints use the
+ * same host:port syntax as create_socket(). Override inherited client settings
+ * so preflight always connects back to this daemon's selected listener. */
+static int configure_preflight_socket(void)
+{
+	const char *address = listen_addr ? listen_addr : socket_path;
+	if (strrchr(address, ':'))
+		return setenv("USBMUXD_SOCKET_ADDRESS", address, 1);
+
+	size_t size = strlen(address) + sizeof("UNIX:");
+	char *endpoint = malloc(size);
+	if (!endpoint)
+		return -1;
+	snprintf(endpoint, size, "UNIX:%s", address);
+	int result = setenv("USBMUXD_SOCKET_ADDRESS", endpoint, 1);
+	int saved_errno = errno;
+	free(endpoint);
+	errno = saved_errno;
+	return result;
+}
+#endif
+
 static int create_socket(void)
 {
 	int listenfd;
@@ -822,6 +845,14 @@ int main(int argc, char *argv[])
 		goto terminate;
 
 #ifdef HAVE_LIBIMOBILEDEVICE
+	/* Preflight uses libimobiledevice to connect back to this daemon. Without
+	 * this, -S starts a private listener but preflight contacts the system
+	 * daemon, leaving the newly enumerated device permanently invisible. */
+	if (configure_preflight_socket() != 0) {
+		usbmuxd_log(LL_FATAL, "Could not configure preflight socket: %s", strerror(errno));
+		res = -1;
+		goto terminate;
+	}
 	const char* userprefdir = config_get_config_dir();
 	usbmuxd_log(LL_NOTICE, "Configuration directory: %s", userprefdir);
 	struct stat fst;
