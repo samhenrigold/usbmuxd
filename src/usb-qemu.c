@@ -698,6 +698,12 @@ static void eth_notify(void *opaque)
 {
 }
 
+/* slirp's fds are gathered afresh every pass (eth_add_poll), so there is no set to maintain;
+ * but slirp calls these unconditionally, and a NULL one is a crash on the first UDP socket. */
+static void eth_register_poll_socket(slirp_os_socket fd, void *opaque)
+{
+}
+
 /* slirp -> guest: one frame, one bulk OUT transaction. The device model retires
  * a transfer per transaction, so no ZLP is needed (or possible) here. */
 static slirp_ssize_t eth_send_packet(const void *buf, size_t len, void *opaque)
@@ -732,6 +738,8 @@ static void eth_start(struct usb_device *dev)
 		.timer_free = eth_timer_free,
 		.timer_mod = eth_timer_mod,
 		.notify = eth_notify,
+		.register_poll_socket = eth_register_poll_socket,
+		.unregister_poll_socket = eth_register_poll_socket,
 	};
 	SlirpConfig cfg;
 
@@ -740,7 +748,7 @@ static void eth_start(struct usb_device *dev)
 
 	/* QEMU's user-mode defaults: 10.0.2.0/24, gateway .2, DNS .3, DHCP from .15. */
 	memset(&cfg, 0, sizeof(cfg));
-	cfg.version = 1;
+	cfg.version = 6;   /* register_poll_socket; v1 would call the deprecated _fd pair */
 	cfg.in_enabled = true;
 	inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
 	inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
@@ -833,6 +841,9 @@ static void eth_process(struct usb_device *dev)
 				f += 2;
 				r -= 2;
 			}
+			/* The kext also sends its 4-byte link-status notice up this pipe. */
+			if (r < 14)
+				continue;
 			usbmuxd_log(LL_INFO, "eth guest->host %d bytes, type %02x%02x", r, f[12], f[13]);
 			slirp_input(slirp, f, r);
 			continue;
