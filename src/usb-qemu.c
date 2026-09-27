@@ -707,6 +707,7 @@ static slirp_ssize_t eth_send_packet(const void *buf, size_t len, void *opaque)
 
 	if (!dev || !dev->alive || !dev->eth_out)
 		return len;
+	usbmuxd_log(LL_INFO, "eth host->guest %zu bytes", len);
 	for (;;) {
 		int r = qemu_xfer(dev->fd, dev->eth_out, 0, len, buf, NULL, NULL);
 		if (r >= 0)
@@ -832,6 +833,7 @@ static void eth_process(struct usb_device *dev)
 				f += 2;
 				r -= 2;
 			}
+			usbmuxd_log(LL_INFO, "eth guest->host %d bytes, type %02x%02x", r, f[12], f[13]);
 			slirp_input(slirp, f, r);
 			continue;
 		}
