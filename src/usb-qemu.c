@@ -1070,6 +1070,17 @@ static struct usb_device *enumerate(int fd)
 			usbmuxd_log(LL_ERROR, "SET_CONFIGURATION %d failed", chosen);
 			goto fail;
 		}
+		/*
+		 * Apple's vendor power request, as a Mac's high-power port sends it
+		 * to an iPhone/iPod/iPad: 500 mA base plus 1600 mA extra. Without it
+		 * a configured device is held at 500 mA and an iPad reads "Not
+		 * Charging"; with it AppleD1815PMUPowerSource reports 2100 mA and
+		 * charges. Failure only means the device keeps 500 mA.
+		 */
+		if ((devdesc[8] | (devdesc[9] << 8)) == 0x05ac &&
+		    ctrl_out(fd, 0x40, 0x40, 500, 1600, NULL) < 0) {
+			usbmuxd_log(LL_INFO, "Apple power request not accepted; staying at 500 mA");
+		}
 		if (dev->altsetting != 0 &&
 		    ctrl_out(fd, 0x01, 0x0b, dev->altsetting, dev->interface, NULL) < 0) {
 			usbmuxd_log(LL_WARNING, "SET_INTERFACE %d/%d failed, continuing",
