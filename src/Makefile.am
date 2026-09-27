@@ -7,12 +7,14 @@ AM_CFLAGS = \
 	$(libplist_CFLAGS) \
 	$(libusb_CFLAGS) \
 	$(limd_glue_CFLAGS) \
+	$(slirp_CFLAGS) \
 	$(libimobiledevice_CFLAGS)
 
 AM_LDFLAGS = \
 	$(libplist_LIBS) \
 	$(libusb_LIBS) \
 	$(limd_glue_LIBS) \
+	$(slirp_LIBS) \
 	$(libimobiledevice_LIBS) \
 	$(libpthread_LIBS)
 
