@@ -42,6 +42,10 @@
 
 #include "usb.h"
 
+#ifdef HAVE_LIBSLIRP
+#include <libslirp.h>
+#endif
+
 /* main.c's shutdown flag. The exit signals are process-blocked outside ppoll(),
  * so a SIGTERM arriving while we are inside enumerate() is not delivered until
  * we return -- which used to mean the app's teardown waited out every control
@@ -125,6 +129,8 @@ struct usb_device {
 	char serial[256];
 	uint8_t address;
 	uint8_t interface, altsetting, ep_in, ep_out;
+	/* AppleUSBEthernet function; eth_in == 0 when the configuration has none. */
+	uint8_t eth_interface, eth_altsetting, eth_in, eth_out;
 	uint16_t pid;
 	uint64_t speed;
 	int wMaxPacketSize;
@@ -463,10 +469,13 @@ static void decode_string(const unsigned char *data, int len, char *out, size_t 
 }
 
 /*
- * Walk a configuration descriptor tree looking for the AppleUSBMux interface
- * (class 255, subclass 254, protocol 2) with one bulk IN and one bulk OUT.
+ * Walk a configuration descriptor tree for the first interface/alt setting of
+ * class `cls`, subclass `sub` (and protocol `proto`, unless it is negative)
+ * that has one bulk IN and one bulk OUT.
  */
-static int find_mux_interface(const unsigned char *cfg, int len, struct usb_device *dev)
+static int find_bulk_interface(const unsigned char *cfg, int len, int cls, int sub,
+                               int proto, uint8_t *intf_out, uint8_t *alt_out,
+                               uint8_t *in_out, uint8_t *out_out)
 {
 	int i = 0;
 	int in_match = 0;
@@ -481,9 +490,8 @@ static int find_mux_interface(const unsigned char *cfg, int len, struct usb_devi
 		if (dtype == 0x04 && dlen >= 9) {          /* INTERFACE */
 			if (in_match && ep_in && ep_out)
 				goto done;
-			in_match = (cfg[i + 5] == INTERFACE_CLASS &&
-			            cfg[i + 6] == INTERFACE_SUBCLASS &&
-			            cfg[i + 7] == INTERFACE_PROTOCOL);
+			in_match = (cfg[i + 5] == cls && cfg[i + 6] == sub &&
+			            (proto < 0 || cfg[i + 7] == proto));
 			intf = cfg[i + 2];
 			alt = cfg[i + 3];
 			ep_in = ep_out = 0;
@@ -504,11 +512,33 @@ done:
 	if (!in_match || !ep_in || !ep_out)
 		return -1;
 
-	dev->interface = intf;
-	dev->altsetting = alt;
-	dev->ep_in = ep_in;
-	dev->ep_out = ep_out;
+	*intf_out = intf;
+	*alt_out = alt;
+	*in_out = ep_in;
+	*out_out = ep_out;
 	return 0;
+}
+
+/* The AppleUSBMux interface (class 255, subclass 254, protocol 2). */
+static int find_mux_interface(const unsigned char *cfg, int len, struct usb_device *dev)
+{
+	return find_bulk_interface(cfg, len, INTERFACE_CLASS, INTERFACE_SUBCLASS,
+	                           INTERFACE_PROTOCOL, &dev->interface, &dev->altsetting,
+	                           &dev->ep_in, &dev->ep_out);
+}
+
+/*
+ * The AppleUSBEthernet interface: Apple's tethering class 255/253 (macOS's
+ * AppleUSBEthernetHost binds protocol 1; any is accepted here). Alt 0 has no
+ * endpoints, the bulk pair lives on alt 1, so this finds alt 1.
+ */
+#define ETH_SUBCLASS 253
+
+static int find_eth_interface(const unsigned char *cfg, int len, struct usb_device *dev)
+{
+	return find_bulk_interface(cfg, len, INTERFACE_CLASS, ETH_SUBCLASS, -1,
+	                           &dev->eth_interface, &dev->eth_altsetting,
+	                           &dev->eth_in, &dev->eth_out);
 }
 
 /*
@@ -564,6 +594,279 @@ static int handshake(int fd, uint8_t *ret_addr)
 	return 0;
 }
 
+/* --- USB Ethernet ------------------------------------------------------- */
+
+/*
+ * AppleUSBEthernet speaks the protocol Linux's ipheth driver documents: one raw
+ * Ethernet frame per bulk transfer, no CDC framing, plus two vendor requests on
+ * EP0 for the device MAC and the carrier state.
+ */
+#define ETH_REQ_TYPE        0xc0   /* vendor, device-to-host, device */
+#define ETH_CMD_GET_MAC     0x00
+#define ETH_CMD_CARRIER     0x45
+#define ETH_CARRIER_ON      0x04
+
+/* How long one frame to the guest may wait for the OUT pipe to be armed. slirp
+ * treats a dropped frame like loss on the wire and TCP retransmits. */
+#define ETH_TX_WAIT_MS 50
+
+/* Read-only diagnostics: the kext's MAC and link state. Neither is needed to
+ * pass traffic, so a guest that STALLs or ignores them costs a short probe. */
+static void eth_probe(int fd, struct usb_device *dev)
+{
+	unsigned char buf[64];
+	int saved = ctrl_timeout_ms, n;
+
+	ctrl_timeout_ms = CTRL_PROBE_MS;
+	n = ctrl_in(fd, ETH_REQ_TYPE, ETH_CMD_GET_MAC, 0, dev->eth_interface, buf, 6);
+	if (n == 6)
+		usbmuxd_log(LL_NOTICE, "USB Ethernet device MAC %02x:%02x:%02x:%02x:%02x:%02x",
+		            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+	else
+		usbmuxd_log(LL_NOTICE, "USB Ethernet: no MAC from vendor request 0x%02x (%d)",
+		            ETH_CMD_GET_MAC, n);
+	n = ctrl_in(fd, ETH_REQ_TYPE, ETH_CMD_CARRIER, 0, dev->eth_interface, buf, sizeof(buf));
+	if (n > 0)
+		usbmuxd_log(LL_NOTICE, "USB Ethernet carrier %s (status 0x%02x)",
+		            buf[0] == ETH_CARRIER_ON ? "on" : "off", buf[0]);
+	else
+		usbmuxd_log(LL_NOTICE, "USB Ethernet: no carrier status from vendor request 0x%02x",
+		            ETH_CMD_CARRIER);
+	ctrl_timeout_ms = saved;
+}
+
+#ifdef HAVE_LIBSLIRP
+
+static Slirp *slirp;
+static struct usb_device *slirp_dev;
+static unsigned char eth_rxbuf[USB_MRU];
+
+/* slirp's own timers (only the IPv6 RA one today, and IPv6 is off). */
+struct eth_timer {
+	SlirpTimerCb cb;
+	void *cb_opaque;
+	int64_t expire_ms;   /* -1: not armed */
+};
+#define ETH_MAX_TIMERS 8
+static struct eth_timer *eth_timers[ETH_MAX_TIMERS];
+
+static int64_t eth_clock_ns(void *opaque)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void *eth_timer_new(SlirpTimerCb cb, void *cb_opaque, void *opaque)
+{
+	int i;
+	for (i = 0; i < ETH_MAX_TIMERS; i++) {
+		if (!eth_timers[i]) {
+			struct eth_timer *t = calloc(1, sizeof(*t));
+			t->cb = cb;
+			t->cb_opaque = cb_opaque;
+			t->expire_ms = -1;
+			eth_timers[i] = t;
+			return t;
+		}
+	}
+	usbmuxd_log(LL_ERROR, "USB Ethernet: out of slirp timers");
+	return NULL;
+}
+
+static void eth_timer_free(void *timer, void *opaque)
+{
+	int i;
+	for (i = 0; i < ETH_MAX_TIMERS; i++)
+		if (eth_timers[i] == timer)
+			eth_timers[i] = NULL;
+	free(timer);
+}
+
+static void eth_timer_mod(void *timer, int64_t expire_ms, void *opaque)
+{
+	if (timer)
+		((struct eth_timer *)timer)->expire_ms = expire_ms;
+}
+
+static void eth_guest_error(const char *msg, void *opaque)
+{
+	usbmuxd_log(LL_WARNING, "USB Ethernet (slirp): %s", msg);
+}
+
+static void eth_notify(void *opaque)
+{
+}
+
+/* slirp -> guest: one frame, one bulk OUT transaction. The device model retires
+ * a transfer per transaction, so no ZLP is needed (or possible) here. */
+static slirp_ssize_t eth_send_packet(const void *buf, size_t len, void *opaque)
+{
+	struct usb_device *dev = slirp_dev;
+	uint64_t deadline = now_ms() + ETH_TX_WAIT_MS;
+
+	if (!dev || !dev->alive || !dev->eth_out)
+		return len;
+	for (;;) {
+		int r = qemu_xfer(dev->fd, dev->eth_out, 0, len, buf, NULL, NULL);
+		if (r >= 0)
+			return len;
+		if (r == RET_IO || r == RET_NODEV) {
+			dev->alive = 0;
+			return -1;
+		}
+		if (r == RET_STALL || now_ms() > deadline)
+			return len;   /* dropped; TCP retransmits */
+		sleep_ms(1);
+	}
+}
+
+static void eth_start(struct usb_device *dev)
+{
+	static const SlirpCb cb = {
+		.send_packet = eth_send_packet,
+		.guest_error = eth_guest_error,
+		.clock_get_ns = eth_clock_ns,
+		.timer_new = eth_timer_new,
+		.timer_free = eth_timer_free,
+		.timer_mod = eth_timer_mod,
+		.notify = eth_notify,
+	};
+	SlirpConfig cfg;
+
+	if (!dev->eth_in || slirp)
+		return;
+
+	/* QEMU's user-mode defaults: 10.0.2.0/24, gateway .2, DNS .3, DHCP from .15. */
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.version = 1;
+	cfg.in_enabled = true;
+	inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
+	inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
+	inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
+	inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
+	inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
+	cfg.vhostname = "LightTouch";
+
+	slirp = slirp_new(&cfg, &cb, NULL);
+	if (!slirp) {
+		usbmuxd_log(LL_ERROR, "USB Ethernet: slirp_new failed");
+		return;
+	}
+	slirp_dev = dev;
+	usbmuxd_log(LL_NOTICE, "USB Ethernet up: slirp %s, guest network 10.0.2.0/24",
+	            slirp_version_string());
+}
+
+static void eth_stop(void)
+{
+	if (!slirp)
+		return;
+	slirp_cleanup(slirp);
+	slirp = NULL;
+	slirp_dev = NULL;
+	usbmuxd_log(LL_NOTICE, "USB Ethernet down");
+}
+
+/* slirp's host sockets, gathered for a zero-timeout poll each pass. */
+#define ETH_MAX_FDS 256
+static struct pollfd eth_pfds[ETH_MAX_FDS];
+static int eth_npfds;
+
+static int eth_add_poll(slirp_os_socket fd, int events, void *opaque)
+{
+	short ev = 0;
+	if (eth_npfds >= ETH_MAX_FDS)
+		return -1;
+	if (events & SLIRP_POLL_IN)  ev |= POLLIN;
+	if (events & SLIRP_POLL_OUT) ev |= POLLOUT;
+	if (events & SLIRP_POLL_PRI) ev |= POLLPRI;
+	eth_pfds[eth_npfds].fd = fd;
+	eth_pfds[eth_npfds].events = ev;
+	eth_pfds[eth_npfds].revents = 0;
+	return eth_npfds++;
+}
+
+static int eth_get_revents(int idx, void *opaque)
+{
+	short rev;
+	int ret = 0;
+	if (idx < 0 || idx >= eth_npfds)
+		return 0;
+	rev = eth_pfds[idx].revents;
+	if (rev & POLLIN)  ret |= SLIRP_POLL_IN;
+	if (rev & POLLOUT) ret |= SLIRP_POLL_OUT;
+	if (rev & POLLPRI) ret |= SLIRP_POLL_PRI;
+	if (rev & POLLERR) ret |= SLIRP_POLL_ERR;
+	if (rev & POLLHUP) ret |= SLIRP_POLL_HUP;
+	return ret;
+}
+
+/*
+ * One pass: drain frames the guest has queued, then service slirp's host
+ * sockets and timers. Called from usb_process(), which already runs every
+ * poll_ms while a device is attached.
+ * ponytail: zero-timeout poll per pass instead of joining main.c's fd list;
+ * fine for browsing, fold slirp's fds into usb_get_fds() if latency matters.
+ */
+static void eth_process(struct usb_device *dev)
+{
+	uint32_t timeout = 0;
+	int64_t now;
+	int i, err;
+
+	if (!slirp || slirp_dev != dev)
+		return;
+
+	for (i = 0; i < RX_BURST && dev->alive; i++) {
+		int r = qemu_xfer(dev->fd, dev->eth_in, 0, sizeof(eth_rxbuf), NULL, eth_rxbuf, NULL);
+		if (r > 0) {
+			/*
+			 * ipheth documents a 2-byte alignment pad in front of every frame
+			 * the device sends. A real destination MAC here is the gateway's
+			 * (52:55:...) or broadcast, never 00:00:..., so strip it only when
+			 * it is actually there.
+			 */
+			const unsigned char *f = eth_rxbuf;
+			if (r > 16 && f[0] == 0 && f[1] == 0) {
+				f += 2;
+				r -= 2;
+			}
+			slirp_input(slirp, f, r);
+			continue;
+		}
+		if (r == RET_IO || r == RET_NODEV) {
+			usbmuxd_log(LL_ERROR, "USB Ethernet bulk IN failed: %s", ret_name(r));
+			dev->alive = 0;
+		}
+		break;   /* NAK (nothing queued), ZLP or STALL */
+	}
+	if (!dev->alive)
+		return;
+
+	eth_npfds = 0;
+	slirp_pollfds_fill_socket(slirp, &timeout, eth_add_poll, NULL);
+	err = eth_npfds ? poll(eth_pfds, eth_npfds, 0) : 0;
+	slirp_pollfds_poll(slirp, err < 0, eth_get_revents, NULL);
+
+	now = eth_clock_ns(NULL) / 1000000;
+	for (i = 0; i < ETH_MAX_TIMERS; i++) {
+		struct eth_timer *t = eth_timers[i];
+		if (t && t->expire_ms >= 0 && t->expire_ms <= now) {
+			t->expire_ms = -1;
+			t->cb(t->cb_opaque);
+		}
+	}
+}
+
+#else  /* !HAVE_LIBSLIRP */
+
+static void eth_start(struct usb_device *dev) {}
+static void eth_stop(void) {}
+static void eth_process(struct usb_device *dev) {}
+
+#endif
+
 /*
  * Drive the link from cable-plug to a configured device with a known serial.
  * Runs inline; the daemon's main loop is blocked while it happens, which is
@@ -579,7 +882,8 @@ static struct usb_device *enumerate(int fd)
 	uint16_t langid = 0x0409;
 	uint8_t iserial;
 	bool resumed;
-	int r, n, cfg_index, chosen = -1;
+	int r, n, cfg_index, chosen = -1, active = -1;
+	struct usb_device found;
 
 	/*
 	 * Is this guest resuming from a snapshot rather than cold-booting?
@@ -669,7 +973,26 @@ static struct usb_device *enumerate(int fd)
 	dev->address = addr;
 	usbmuxd_log(LL_NOTICE, "Device address is %d", addr);
 
-	/* Configuration descriptors: 9 bytes for wTotalLength, then the tree. */
+	/*
+	 * A resumed guest stays in whatever configuration the snapshot had, so the
+	 * descriptors must be read for that one, not for the one we would pick.
+	 */
+	if (resumed) {
+		unsigned char cur;
+		if (ctrl_in(fd, 0x80, 0x08, 0, 0, &cur, 1) == 1)
+			active = cur;
+		usbmuxd_log(LL_NOTICE, "Active configuration is %d", active);
+	}
+
+	/*
+	 * Configuration descriptors: 9 bytes for wTotalLength, then the tree.
+	 *
+	 * Prefer a configuration carrying both the mux and the AppleUSBEthernet
+	 * function (the iPad's "PTP + Apple Mobile Device + Apple USB Ethernet");
+	 * fall back to the first one with the mux alone. Stopping at the first mux
+	 * match picked the mux-only configuration and the Ethernet function never
+	 * started.
+	 */
 	for (cfg_index = 0; cfg_index < devdesc[17]; cfg_index++) {
 		int total;
 		n = ctrl_in(fd, 0x80, 0x06, (0x02 << 8) | cfg_index, 0, cfgbuf, 9);
@@ -687,13 +1010,34 @@ static struct usb_device *enumerate(int fd)
 			usbmuxd_log(LL_WARNING, "Short configuration %d (%d of %d)", cfg_index, n, total);
 			continue;
 		}
-		if (find_mux_interface(cfgbuf, n, dev) == 0) {
-			chosen = cfgbuf[5];   /* bConfigurationValue */
+		if (active >= 0 && cfgbuf[5] != active)
+			continue;
+		memset(&found, 0, sizeof(found));
+		if (find_mux_interface(cfgbuf, n, &found) < 0)
+			continue;
+#ifdef HAVE_LIBSLIRP
+		find_eth_interface(cfgbuf, n, &found);
+#endif
+		if (chosen >= 0 && !found.eth_in)
+			continue;             /* already have a mux-only fallback */
+		chosen = cfgbuf[5];   /* bConfigurationValue */
+		dev->interface = found.interface;
+		dev->altsetting = found.altsetting;
+		dev->ep_in = found.ep_in;
+		dev->ep_out = found.ep_out;
+		dev->eth_interface = found.eth_interface;
+		dev->eth_altsetting = found.eth_altsetting;
+		dev->eth_in = found.eth_in;
+		dev->eth_out = found.eth_out;
+		usbmuxd_log(LL_NOTICE,
+		            "Found the mux interface in configuration %d (value %d): "
+		            "interface %d alt %d, endpoints in 0x%02x out 0x%02x",
+		            cfg_index, chosen, dev->interface, dev->altsetting,
+		            dev->ep_in, dev->ep_out);
+		if (dev->eth_in) {
 			usbmuxd_log(LL_NOTICE,
-			            "Found the mux interface in configuration %d (value %d): "
-			            "interface %d alt %d, endpoints in 0x%02x out 0x%02x",
-			            cfg_index, chosen, dev->interface, dev->altsetting,
-			            dev->ep_in, dev->ep_out);
+			            "  with USB Ethernet: interface %d alt %d, endpoints in 0x%02x out 0x%02x",
+			            dev->eth_interface, dev->eth_altsetting, dev->eth_in, dev->eth_out);
 			break;
 		}
 	}
@@ -718,7 +1062,16 @@ static struct usb_device *enumerate(int fd)
 			usbmuxd_log(LL_WARNING, "SET_INTERFACE %d/%d failed, continuing",
 			            dev->interface, dev->altsetting);
 		}
+		/* AppleUSBEthernetDevice creates its bulk pipes only on alt 1. */
+		if (dev->eth_in &&
+		    ctrl_out(fd, 0x01, 0x0b, dev->eth_altsetting, dev->eth_interface, NULL) < 0) {
+			usbmuxd_log(LL_WARNING, "SET_INTERFACE %d/%d (Ethernet) failed; no network",
+			            dev->eth_interface, dev->eth_altsetting);
+			dev->eth_in = dev->eth_out = 0;
+		}
 	}
+	if (dev->eth_in)
+		eth_probe(fd, dev);
 
 	/* Index 0 is the list of supported language IDs. */
 	n = ctrl_in(fd, 0x80, 0x06, (0x03 << 8) | 0, 0, strbuf, sizeof(strbuf));
@@ -815,6 +1168,7 @@ int usb_init(void)
 
 void usb_shutdown(void)
 {
+	eth_stop();
 	if (the_device) {
 		device_remove(the_device);
 		close(the_device->fd);
@@ -1008,6 +1362,7 @@ static void reap(void)
 		return;
 	usbmuxd_log(LL_NOTICE, "Device went away");
 	the_device = NULL;
+	eth_stop();
 	device_remove(dev);
 	close(dev->fd);
 	free(dev);
@@ -1047,6 +1402,8 @@ int usb_process(void)
 				the_device = NULL;
 				close(fd);
 				free(dev);
+			} else {
+				eth_start(dev);
 			}
 		}
 	}
@@ -1071,6 +1428,8 @@ int usb_process(void)
 			}
 			break;   /* NAK: nothing queued right now */
 		}
+		if (dev->alive)
+			eth_process(dev);
 	}
 
 	reap();

@@ -24,6 +24,14 @@ PKG_CHECK_MODULES(libusb, libusb-1.0 >= 1.0.9)
 PKG_CHECK_MODULES(libplist, libplist-2.0 >= 2.6.0)
 PKG_CHECK_MODULES(libimobiledevice, libimobiledevice-1.0 >= 1.3.0, have_limd=yes, have_limd=no)
 PKG_CHECK_MODULES(limd_glue, libimobiledevice-glue-1.0 >= 1.0.0)
+# USB Ethernet (iPad): bridge the guest's AppleUSBEthernet frames into slirp.
+# Optional; without it the Ethernet function is simply left unconfigured.
+PKG_CHECK_MODULES(slirp, slirp >= 4.0, have_slirp=yes, have_slirp=no)
+if test "x$have_slirp" = "xyes"; then
+  AC_DEFINE(HAVE_LIBSLIRP, 1, [Define if libslirp is available for USB Ethernet])
+  # Static builds (the app package) need glib's private libs as well.
+  slirp_LIBS=`$PKG_CONFIG --static --libs slirp`
+fi
 
 AC_ARG_WITH([preflight],
             [AS_HELP_STRING([--without-preflight],
