@@ -475,11 +475,12 @@ static void decode_string(const unsigned char *data, int len, char *out, size_t 
  */
 static int find_bulk_interface(const unsigned char *cfg, int len, int cls, int sub,
                                int proto, uint8_t *intf_out, uint8_t *alt_out,
-                               uint8_t *in_out, uint8_t *out_out)
+                               uint8_t *in_out, uint8_t *out_out, int *out_mps)
 {
 	int i = 0;
 	int in_match = 0;
 	uint8_t intf = 0, alt = 0, ep_in = 0, ep_out = 0;
+	int mps = 0;
 
 	while (i + 1 < len) {
 		int dlen = cfg[i];
@@ -499,10 +500,12 @@ static int find_bulk_interface(const unsigned char *cfg, int len, int cls, int s
 			uint8_t addr = cfg[i + 2];
 			uint8_t attr = cfg[i + 3] & 0x03;
 			if (attr == 0x02) {                     /* bulk */
-				if (addr & 0x80)
+				if (addr & 0x80) {
 					ep_in = addr;
-				else
+				} else {
 					ep_out = addr;
+					mps = (cfg[i + 4] | (cfg[i + 5] << 8)) & 0x7ff;
+				}
 			}
 		}
 		i += dlen;
@@ -516,6 +519,8 @@ done:
 	*alt_out = alt;
 	*in_out = ep_in;
 	*out_out = ep_out;
+	if (out_mps)
+		*out_mps = mps;
 	return 0;
 }
 
@@ -524,7 +529,7 @@ static int find_mux_interface(const unsigned char *cfg, int len, struct usb_devi
 {
 	return find_bulk_interface(cfg, len, INTERFACE_CLASS, INTERFACE_SUBCLASS,
 	                           INTERFACE_PROTOCOL, &dev->interface, &dev->altsetting,
-	                           &dev->ep_in, &dev->ep_out);
+	                           &dev->ep_in, &dev->ep_out, &dev->wMaxPacketSize);
 }
 
 /*
@@ -538,7 +543,7 @@ static int find_eth_interface(const unsigned char *cfg, int len, struct usb_devi
 {
 	return find_bulk_interface(cfg, len, INTERFACE_CLASS, ETH_SUBCLASS, -1,
 	                           &dev->eth_interface, &dev->eth_altsetting,
-	                           &dev->eth_in, &dev->eth_out);
+	                           &dev->eth_in, &dev->eth_out, NULL);
 }
 
 /*
@@ -705,7 +710,7 @@ static void eth_register_poll_socket(slirp_os_socket fd, void *opaque)
 }
 
 /* slirp -> guest: one frame, one bulk OUT transaction. The device model retires
- * a transfer per transaction, so no ZLP is needed (or possible) here. */
+ * a transfer per transaction, so no ZLP is sent here. */
 static slirp_ssize_t eth_send_packet(const void *buf, size_t len, void *opaque)
 {
 	struct usb_device *dev = slirp_dev;
@@ -956,7 +961,6 @@ static struct usb_device *enumerate(int fd)
 	dev->alive = 1;
 	dev->speed = 480000000;
 	dev->pid = devdesc[10] | (devdesc[11] << 8);
-	dev->wMaxPacketSize = devdesc[7] ? devdesc[7] : 64;
 	iserial = devdesc[16];
 
 	usbmuxd_log(LL_NOTICE, "Device %04x:%04x, bcdUSB %x.%02x, %d configuration(s)",
@@ -1038,15 +1042,16 @@ static struct usb_device *enumerate(int fd)
 		dev->altsetting = found.altsetting;
 		dev->ep_in = found.ep_in;
 		dev->ep_out = found.ep_out;
+		dev->wMaxPacketSize = found.wMaxPacketSize;
 		dev->eth_interface = found.eth_interface;
 		dev->eth_altsetting = found.eth_altsetting;
 		dev->eth_in = found.eth_in;
 		dev->eth_out = found.eth_out;
 		usbmuxd_log(LL_NOTICE,
 		            "Found the mux interface in configuration %d (value %d): "
-		            "interface %d alt %d, endpoints in 0x%02x out 0x%02x",
+		            "interface %d alt %d, endpoints in 0x%02x out 0x%02x (max packet %d)",
 		            cfg_index, chosen, dev->interface, dev->altsetting,
-		            dev->ep_in, dev->ep_out);
+		            dev->ep_in, dev->ep_out, dev->wMaxPacketSize);
 		if (dev->eth_in) {
 			usbmuxd_log(LL_NOTICE,
 			            "  with USB Ethernet: interface %d alt %d, endpoints in 0x%02x out 0x%02x",
@@ -1255,6 +1260,13 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 	static unsigned call_seq;
 	unsigned seq = ++call_seq;
 	int sent = 0, txn = 0, naks = 0, accepted = 0;
+	/*
+	 * A write that ends on a max-packet boundary is followed by a zero-length
+	 * packet, as the libusb backend does (and a Mac's stack): iOS 4's mux
+	 * needs it to see where the transfer ends. It goes over the wire as a
+	 * zero-length OUT, which the device model delivers as a real ZLP.
+	 */
+	int zlp = dev->wMaxPacketSize > 0 && length % dev->wMaxPacketSize == 0;
 	uint64_t deadline = now_ms() + SEND_TIMEOUT_MS;
 
 	/*
@@ -1267,7 +1279,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 
 	usbmuxd_log(LL_NOTICE, "OUT#%u begin: %d bytes to ep 0x%02x", seq, length, dev->ep_out);
 
-	while (sent < length) {
+	while (sent < length || zlp) {
 		int chunk = length - sent;
 		int r;
 		if (chunk > QEMU_MAX_XFER)
@@ -1275,6 +1287,11 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 
 		r = qemu_xfer(dev->fd, dev->ep_out, 0, chunk, buf + sent, NULL, NULL);
 		txn++;
+		if (r == 0 && chunk == 0) {
+			usbmuxd_log(LL_NOTICE, "OUT#%u txn %d: ZLP (after %d NAKs)", seq, txn, naks);
+			zlp = 0;
+			continue;
+		}
 		if (r > 0) {
 			usbmuxd_log(LL_NOTICE,
 			            "OUT#%u txn %d: offset %d submitted %d accepted %d -> offset %d (after %d NAKs)",
