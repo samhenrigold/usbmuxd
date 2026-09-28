@@ -100,6 +100,15 @@ struct tcp_usb_hello {
 
 #define DEFAULT_PORT 1235
 #define DEFAULT_POLL_MS 3
+/*
+ * Once nothing has crossed the link for IDLE_AFTER_MS, poll this slowly: at
+ * 3 ms an idle device cost 5-24% of a core in bulk-IN polling alone. The first
+ * packet either way (a client's OUT, or IN data) brings the 3 ms cadence back,
+ * so a request never waits more than one slow tick. USBMUXD_QEMU_IDLE_POLL_MS
+ * overrides it; 0 (or anything not above the poll) disables the backoff.
+ */
+#define DEFAULT_IDLE_POLL_MS 50
+#define IDLE_AFTER_MS 1000
 
 /* How long to keep retrying a NAKing transaction before giving up. */
 #define CTRL_TIMEOUT_MS   15000
@@ -156,6 +165,8 @@ static int first_dial = 1;           /* the configured delay is for dial #1 only
 static struct usb_device *the_device;
 static int autodiscover = 1;
 static int poll_ms = DEFAULT_POLL_MS;
+static int idle_poll_ms = DEFAULT_IDLE_POLL_MS;
+static uint64_t last_traffic_ms;   /* the last transaction that carried data, either way */
 
 /*
  * How long the guest gets to become ready. QEMU dials us as soon as the machine
@@ -282,6 +293,8 @@ static int qemu_xfer(int fd, uint8_t ep, uint8_t flags, int length,
 
 	if (length > QEMU_MAX_XFER)
 		length = QEMU_MAX_XFER;
+	if (!(ep & USB_DIR_IN) && length > 0)
+		last_traffic_ms = now_ms();   /* the host is talking: poll fast for the reply */
 
 	hdr.addr = 0;
 	hdr.ep = ep;
@@ -323,6 +336,7 @@ static int qemu_xfer(int fd, uint8_t ep, uint8_t flags, int length,
 				left -= chunk;
 			}
 		}
+		last_traffic_ms = now_ms();
 		return n;
 	}
 
@@ -1141,6 +1155,7 @@ int usb_init(void)
 {
 	const char *spec = getenv("USBMUXD_QEMU_ADDR");
 	const char *pollspec = getenv("USBMUXD_QEMU_POLL_MS");
+	const char *idlespec = getenv("USBMUXD_QEMU_IDLE_POLL_MS");
 	char host[128] = "127.0.0.1";
 	int port = DEFAULT_PORT;
 	struct sockaddr_in sa;
@@ -1163,6 +1178,8 @@ int usb_init(void)
 	}
 	if (pollspec && atoi(pollspec) > 0)
 		poll_ms = atoi(pollspec);
+	if (idlespec)
+		idle_poll_ms = atoi(idlespec);
 
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0) {
@@ -1191,7 +1208,8 @@ int usb_init(void)
 		return -1;
 	}
 
-	usbmuxd_log(LL_NOTICE, "QEMU USB backend listening on %s:%d (poll %d ms)", host, port, poll_ms);
+	usbmuxd_log(LL_NOTICE, "QEMU USB backend listening on %s:%d (poll %d ms, %d ms after %d ms idle)",
+	            host, port, poll_ms, idle_poll_ms, IDLE_AFTER_MS);
 	return 0;
 }
 
@@ -1249,7 +1267,7 @@ void usb_get_fds(struct fdlist *list)
 int usb_get_timeout(void)
 {
 	if (the_device && the_device->alive)
-		return poll_ms;
+		return idle_poll_ms > poll_ms && now_ms() - last_traffic_ms >= IDLE_AFTER_MS ? idle_poll_ms : poll_ms;
 	if (pending_fd >= 0)
 		return 50;
 	return 1000;
