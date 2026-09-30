@@ -412,7 +412,7 @@ static int ctrl_in(int fd, uint8_t bmRequestType, uint8_t bRequest,
 {
 	unsigned char setup[8];
 	uint64_t deadline;
-	int total = 0, naks = 0;
+	int total = 0;
 
 	fill_setup(setup, bmRequestType | 0x80, bRequest, wValue, wIndex, wLength);
 	if (send_setup(fd, setup, NULL) < 0)
@@ -420,10 +420,13 @@ static int ctrl_in(int fd, uint8_t bmRequestType, uint8_t bRequest,
 
 	deadline = now_ms() + ctrl_timeout_ms;
 	while (total < wLength) {
-		int r = qemu_xfer(fd, USB_DIR_IN, 0, wLength - total, NULL, buf + total, NULL);
+		int requested = wLength - total < 64 ? wLength - total : 64;
+		int r = qemu_xfer(fd, USB_DIR_IN, 0, requested, NULL, buf + total, NULL);
 		if (r > 0) {
 			total += r;
-			naks = 0;
+			if (r < requested) { /* actual short EP0 packet */
+				break;
+			}
 			continue;
 		}
 		if (r == 0)          /* short/zero packet terminates the transfer */
@@ -435,8 +438,8 @@ static int ctrl_in(int fd, uint8_t bmRequestType, uint8_t bRequest,
 			return -1;
 		}
 		/* NAK */
-		if (total > 0 && ++naks > IN_IDLE_NAKS)
-			break;
+		/* NAK is flow control, never a short packet. Keep the transfer
+		 * open until data, a ZLP, or the full control timeout. */
 		if (now_ms() > deadline || should_exit) {
 			if (total > 0)
 				break;

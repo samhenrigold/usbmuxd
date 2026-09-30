@@ -6,8 +6,12 @@ EXTRA_DIST = \
 	docs \
 	COPYING.GPLv2 \
 	COPYING.GPLv3 \
-	README.md
+	README.md \
+	tests/check-control-transfer.py
 
 DISTCHECK_CONFIGURE_FLAGS = \
 	--with-udevrulesdir=$$dc_install_base/$(udevrulesdir) \
 	--with-systemdsystemunitdir=$$dc_install_base/$(systemdsystemunitdir)
+
+check-local:
+	python3 $(srcdir)/tests/check-control-transfer.py --usbmuxd $(builddir)/src/usbmuxd
