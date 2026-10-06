@@ -52,6 +52,8 @@
  * timeout while the listening socket stayed bound. */
 extern int should_exit;
 #include "log.h"
+/* Per-transfer lines (IN#/OUT#) are LL_DEBUG: one per USB transfer, thousands a second while the guest
+ * talks. The app's usbmuxd runs -f -v (LL_INFO) and leaves them out; -v -v shows them. */
 #include "device.h"
 #include "utils.h"
 
@@ -1298,7 +1300,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 	if (!dev->alive)
 		return -1;
 
-	usbmuxd_log(LL_NOTICE, "OUT#%u begin: %d bytes to ep 0x%02x", seq, length, dev->ep_out);
+	usbmuxd_log(LL_DEBUG, "OUT#%u begin: %d bytes to ep 0x%02x", seq, length, dev->ep_out);
 
 	while (sent < length || zlp) {
 		int chunk = length - sent;
@@ -1309,12 +1311,12 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 		r = qemu_xfer(dev->fd, dev->ep_out, 0, chunk, buf + sent, NULL, NULL);
 		txn++;
 		if (r == 0 && chunk == 0) {
-			usbmuxd_log(LL_NOTICE, "OUT#%u txn %d: ZLP (after %d NAKs)", seq, txn, naks);
+			usbmuxd_log(LL_DEBUG, "OUT#%u txn %d: ZLP (after %d NAKs)", seq, txn, naks);
 			zlp = 0;
 			continue;
 		}
 		if (r > 0) {
-			usbmuxd_log(LL_NOTICE,
+			usbmuxd_log(LL_DEBUG,
 			            "OUT#%u txn %d: offset %d submitted %d accepted %d -> offset %d (after %d NAKs)",
 			            seq, txn, sent, chunk, r, sent + r, naks);
 			sent += r;
@@ -1349,7 +1351,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 
 	/* "accepted" is what answers "was this split?" - txn also counts NAK
 	 * retries, which are just flow control and say nothing about framing. */
-	usbmuxd_log(LL_NOTICE, "OUT#%u done: %d bytes, %s (%d accepted transfer(s), %d round trip(s))",
+	usbmuxd_log(LL_DEBUG, "OUT#%u done: %d bytes, %s (%d accepted transfer(s), %d round trip(s))",
 	            seq, sent, accepted > 1 ? "SPLIT" : "whole", accepted, txn);
 	free((void *)buf);
 	return 0;
@@ -1476,7 +1478,7 @@ int usb_process(void)
 			int r = qemu_xfer(dev->fd, dev->ep_in, 0, USB_MRU, NULL, dev->rxbuf, NULL);
 			if (r > 0) {
 				static unsigned in_seq;
-				usbmuxd_log(LL_NOTICE, "IN#%u: %d bytes from ep 0x%02x (requested %d)",
+				usbmuxd_log(LL_DEBUG, "IN#%u: %d bytes from ep 0x%02x (requested %d)",
 				            ++in_seq, r, dev->ep_in, USB_MRU);
 				device_data_input(dev, dev->rxbuf, r);
 				if (!the_device || !the_device->alive)
