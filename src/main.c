@@ -249,7 +249,8 @@ static int create_socket(void)
 			usbmuxd_log(LL_FATAL, "bind() failed: %s", strerror(errno));
 			return -1;
 		}
-		chmod(socket_addr, 0666);
+		/* The system socket is for every user; a private -S path is its owner's alone. */
+		chmod(socket_addr, strcmp(socket_addr, socket_path) != 0 ? 0600 : 0666);
 
 		snprintf(listen_addr_str, sizeof(listen_addr_str), "%s", socket_addr);
 	}

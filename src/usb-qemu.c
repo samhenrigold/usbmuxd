@@ -39,6 +39,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 
 #include "usb.h"
 
@@ -149,6 +151,8 @@ struct usb_device {
 };
 
 static int listen_fd = -1;
+/* USBMUXD_QEMU_ADDR as a path: a Unix socket, owner-only, removed at shutdown. */
+static char *listen_path = NULL;
 static int pending_fd = -1;          /* accepted, enumeration not started */
 static int ctrl_timeout_ms = CTRL_TIMEOUT_MS;  /* tightened for the first probe */
 /*
@@ -1166,6 +1170,42 @@ int usb_init(void)
 	struct sockaddr_in sa;
 	int one = 1;
 
+	if (pollspec && atoi(pollspec) > 0)
+		poll_ms = atoi(pollspec);
+	if (idlespec)
+		idle_poll_ms = atoi(idlespec);
+
+	if (spec && spec[0] == '/') {
+		struct sockaddr_un su;
+		if (strlen(spec) >= sizeof(su.sun_path)) {
+			usbmuxd_log(LL_FATAL, "QEMU socket path too long: %s", spec);
+			return -1;
+		}
+		memset(&su, 0, sizeof(su));
+		su.sun_family = AF_UNIX;
+		strcpy(su.sun_path, spec);
+		listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (listen_fd < 0) {
+			usbmuxd_log(LL_FATAL, "Could not create the QEMU listening socket: %s", strerror(errno));
+			return -1;
+		}
+		fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL, 0) | O_NONBLOCK);
+		unlink(spec);
+		mode_t old = umask(077);
+		int bound = bind(listen_fd, (struct sockaddr *)&su, sizeof(su));
+		umask(old);
+		if (bound < 0 || listen(listen_fd, 1) < 0) {
+			usbmuxd_log(LL_FATAL, "Could not listen on %s: %s", spec, strerror(errno));
+			close(listen_fd);
+			listen_fd = -1;
+			return -1;
+		}
+		listen_path = strdup(spec);
+		usbmuxd_log(LL_NOTICE, "QEMU USB backend listening on %s (poll %d ms, %d ms after %d ms idle)",
+		            spec, poll_ms, idle_poll_ms, IDLE_AFTER_MS);
+		return 0;
+	}
+
 	if (spec && *spec) {
 		const char *colon = strrchr(spec, ':');
 		if (colon) {
@@ -1181,10 +1221,6 @@ int usb_init(void)
 		if (port <= 0 || port > 65535)
 			port = DEFAULT_PORT;
 	}
-	if (pollspec && atoi(pollspec) > 0)
-		poll_ms = atoi(pollspec);
-	if (idlespec)
-		idle_poll_ms = atoi(idlespec);
 
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0) {
@@ -1234,6 +1270,11 @@ void usb_shutdown(void)
 	if (listen_fd >= 0) {
 		close(listen_fd);
 		listen_fd = -1;
+	}
+	if (listen_path) {
+		unlink(listen_path);
+		free(listen_path);
+		listen_path = NULL;
 	}
 }
 
