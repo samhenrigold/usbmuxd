@@ -41,7 +41,7 @@
 // and the device model treats each one as a completed transfer, raising
 // XferCompl and disabling the endpoint even when the guest's armed transfer is
 // only partly filled. The guest's mux driver then reassembles from truncated
-// transfers and the stream desynchronises. Capping the MTU keeps every mux
+// transfers and the stream desynchronizes. Capping the MTU keeps every mux
 // packet inside a single transaction; device.c derives conn->max_payload from
 // this, so it bounds the whole TX path.
 #define USB_MTU 16384

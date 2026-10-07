@@ -962,7 +962,7 @@ static struct usb_device *enumerate(int fd)
 			return NULL;
 		sleep_ms(500);
 
-		usbmuxd_log(LL_NOTICE, "Signalling enumeration done");
+		usbmuxd_log(LL_NOTICE, "Signaling enumeration done");
 		if (qemu_xfer(fd, 0x00, TU_ENUMDONE, 0, NULL, NULL, NULL) == RET_IO)
 			return NULL;
 		sleep_ms(500);
